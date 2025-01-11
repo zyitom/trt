@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(test_trt)
+project(test_trt CUDA CXX) 
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,15 +7,18 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(CUDA_TOOLKIT_ROOT_DIR "/usr/local/cuda")
 find_package(CUDA REQUIRED)
-
+enable_language(CUDA) 
 
 file(GLOB COMMON_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 file(GLOB UTILS_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/.cpp")
+file(GLOB CUDA_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cu")  
 
 find_package(OpenCV REQUIRED)
 
 message(STATUS "Common sources: ${COMMON_SOURCES}")
 message(STATUS "Utils sources: ${UTILS_SOURCES}")
+message(STATUS "CUDA sources: ${CUDA_SOURCES}")  
+
 
 link_directories(
     ${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/lib
@@ -34,13 +37,17 @@ include_directories(
     ${OpenCV_INCLUDE_DIRS}
 )
 
+set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS} -std=c++17)
 
 add_executable(trt_exec
     trtexec.cpp
     ${COMMON_SOURCES}
     ${UTILS_SOURCES}
-        sampleUtils.cpp
+    ${CUDA_SOURCES}  
+    sampleUtils.cpp
 )
+
+
 
 target_link_libraries(trt_exec
     -L${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/lib
@@ -54,4 +61,5 @@ target_link_libraries(trt_exec
     -lnvinfer_plugin
     -ldl
     -lpthread
+    ${OpenCV_LIBS}  
 )

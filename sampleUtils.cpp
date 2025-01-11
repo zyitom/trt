@@ -1,4 +1,5 @@
 #include "sampleUtils.h"
+#include "logger.h"
 
 namespace sample {
     size_t dataTypeSize(nvinfer1::DataType dataType)

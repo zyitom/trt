@@ -18,6 +18,7 @@
 #ifndef TRT_SAMPLE_INFERENCE_H
 #define TRT_SAMPLE_INFERENCE_H
 
+#include "opencv2/core/mat.hpp"
 #include "sampleDevice.h"
 #include "sampleEngines.h"
 #include "sampleUtils.h"
@@ -66,6 +67,7 @@ struct InferenceEnvironment
     //! but it simplifies control-flow to store the data here since it's shared across
     //! the bindings.
     std::list<std::vector<int32_t>> inputShapeTensorValues;
+
 };
 
 inline nvinfer1::IExecutionContext* InferenceEnvironment::getContext(int32_t streamIdx)
@@ -92,7 +94,37 @@ bool runInference(
 
 
 struct Binding
-{
+{   
+    struct ImageInfo {
+        uint8_t* data{nullptr};
+        int width{0};
+        int height{0};
+        bool needNormalize{false};
+    } imageInfo;
+    uint8_t* pinnedBuffer{nullptr};
+    bool hasPendingImageProcess{false};
+
+
+void setupImagePreprocess(uint8_t* imgData, int width, int height, bool normalize) {
+    sample::gLogInfo << "\n=== setupImagePreprocess START ===\n"<<  std::endl;
+    
+    imageInfo.data = imgData;
+    imageInfo.width = width;
+    imageInfo.height = height;
+    imageInfo.needNormalize = normalize;
+
+    if (!pinnedBuffer) {
+        sample::gLogInfo << "Allocating new pinned buffer" << std::endl;
+        CHECK(cudaMallocHost(&pinnedBuffer, width * height * 3));
+    }
+    
+    sample::gLogInfo << "Copying image data to pinned buffer" << std::endl;
+    memcpy(pinnedBuffer, imgData, width * height * 3);
+    hasPendingImageProcess = true;
+    
+    sample::gLogInfo << "\nAfter setup:\n" << std::endl;
+}
+
     bool isInput{false};
     std::unique_ptr<IMirroredBuffer> buffer;
     std::unique_ptr<OutputAllocator> outputAllocator;
@@ -128,6 +160,7 @@ struct TensorInfo
 class Bindings
 {
 public:
+
     Bindings() = delete;
     explicit Bindings(bool useManaged)
         : mUseManaged(useManaged)
@@ -215,6 +248,19 @@ public:
 
     bool setTensorAddresses(nvinfer1::IExecutionContext& context) const;
 
+    struct ImageInfo {
+        uint8_t* data{nullptr};
+        int width{0};
+        int height{0};
+        bool needNormalize{false};  
+    } imageInfo;
+    
+    void preprocessImage(uint8_t* imgData, int width, int height, bool normalize, cudaStream_t stream);
+    const int MODEL_INPUT_HEIGHT = 384 ;
+    const int MODEL_INPUT_WIDTH  = 480 ;
+
+    float scale = std::min(MODEL_INPUT_HEIGHT / (float)imageInfo.height, 
+                            MODEL_INPUT_WIDTH / (float)imageInfo.width);
 private:
     std::unordered_map<std::string, int32_t> mNames;
     std::vector<Binding> mBindings;

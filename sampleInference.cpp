@@ -45,6 +45,9 @@
 #include "sampleInference.h"
 #include "sampleOptions.h"
 #include "sampleUtils.h"
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include "preprocess.cuh"
 using namespace nvinfer1;
 namespace sample
 {
@@ -685,6 +688,7 @@ public:
     // jetson不用 skiptransfer
     bool query(bool skipTransfers)
     {
+        sample::gLogInfo << "Querying stream with skipTransfers: " << skipTransfers << std::endl;
         if (mActive[mNext])
         {
             return true;
@@ -735,6 +739,14 @@ public:
 
     void setInputData(bool sync)
     {
+
+
+        sample::gLogInfo << "Setting input data, sync: " << sync << std::endl;
+    
+
+        if (mBindings.imageInfo.data) {
+            sample::gLogInfo << "Found image data to process" << std::endl;
+        }
         mBindings.transferInputToDevice(getStream(StreamType::kINPUT));
         // additional sync to avoid overlapping with inference execution.
         if (sync)
@@ -762,7 +774,6 @@ private:
 
     TrtCudaStream& getStream(StreamType t)
     {   
-        sample::gLogInfo << "Stream type index: " << static_cast<int32_t>(t) << std::endl;
         return mStream[static_cast<int32_t>(t)];
     }
 
@@ -929,8 +940,6 @@ bool runInference(
 {
     SMP_RETVAL_IF_FALSE(!iEnv.safe, "Safe inference is not supported!", false, sample::gLogError);
 
-
-
     SyncStruct sync;
 
     sync.gpuStart.record(sync.mainStream);
@@ -960,15 +969,25 @@ void Binding::fill(std::string const& fileName)
     loadFromFile(fileName, static_cast<char*>(buffer->getHostBuffer()), buffer->getSize());
 }
 
-void Binding::fill()
-{
-    switch (dataType)
-    {
-    case nvinfer1::DataType::kFLOAT:
-    {
-        fillBuffer<float>(buffer->getHostBuffer(), volume, -1.0F, 1.0F);
-        break;
-    }
+void Binding::fill() {
+    sample::gLogInfo << "Starting fill() with imageInfo.data: " << (imageInfo.data ? "present" : "null") << std::endl;
+    
+    if (imageInfo.data) {
+        sample::gLogInfo << "Processing image of size: " << imageInfo.width << "x" << imageInfo.height << std::endl;
+        size_t imageSize = imageInfo.width * imageInfo.height * 3;
+        if (!pinnedBuffer) {
+            CHECK(cudaMallocHost(&pinnedBuffer, imageSize));
+        }
+        memcpy(pinnedBuffer, imageInfo.data, imageSize);
+        hasPendingImageProcess = true;
+        sample::gLogInfo << "Image data copied to pinned memory" << std::endl;
+    } else {
+        sample::gLogInfo << "No image data, using random values" << std::endl;
+        switch (dataType) {
+        case nvinfer1::DataType::kFLOAT:
+            fillBuffer<float>(buffer->getHostBuffer(), volume, -1.0F, 1.0F);
+            break;
+        }
     }
 }
 
@@ -1028,18 +1047,115 @@ void** Bindings::getDeviceBuffers()
 {
     return mDevicePointers.data();
 }
+void Bindings::transferInputToDevice(TrtCudaStream& stream) {
 
-void Bindings::transferInputToDevice(TrtCudaStream& stream)
-{
-    for (auto& b : mNames)
-    {
-        if (mBindings[b.second].isInput)
-        {
-            mBindings[b.second].buffer->hostToDevice(stream);
+    sample::gLogInfo << "Starting transferInputToDevice" << std::endl;
+
+    for (auto& b : mNames) {
+        sample::gLogInfo << "Processing binding: isInput=" << mBindings[b.second].isInput 
+                        << ", hasPendingImage=" << mBindings[b.second].hasPendingImageProcess << std::endl;
+        
+        if (mBindings[b.second].isInput) {
+            if (mBindings[b.second].hasPendingImageProcess) {
+                auto& binding = mBindings[b.second];
+                sample::gLogInfo << "Image info: width=" << binding.imageInfo.width 
+                               << ", height=" << binding.imageInfo.height 
+                               << ", data=" << (binding.imageInfo.data != nullptr) 
+                               << ", pinned=" << (binding.pinnedBuffer != nullptr) << std::endl;
+                
+                float* deviceDst = static_cast<float*>(binding.buffer->getDeviceBuffer());
+                if (!deviceDst) {
+                    sample::gLogError << "Device buffer is null!" << std::endl;
+                    continue;
+                }
+                
+
+                float scale = std::min(MODEL_INPUT_HEIGHT / (float)binding.imageInfo.height,
+                                     MODEL_INPUT_WIDTH / (float)binding.imageInfo.width);
+                
+                sample::gLogInfo << "Scale computed: " << scale << std::endl;
+                
+                try {
+                    float* d_warpMatrix;
+                    float h_warpMatrix[6];
+                    h_warpMatrix[0] = scale;
+                    h_warpMatrix[1] = 0;
+                    h_warpMatrix[2] = -scale * binding.imageInfo.width * 0.5 + MODEL_INPUT_WIDTH * 0.5;
+                    h_warpMatrix[3] = 0;
+                    h_warpMatrix[4] = scale;
+                    h_warpMatrix[5] = -scale * binding.imageInfo.height * 0.5 + MODEL_INPUT_HEIGHT * 0.5;
+                    cudaError_t error = cudaMalloc(&d_warpMatrix, sizeof(float) * 6);
+                    if (error != cudaSuccess) {
+                        sample::gLogError << "cudaMalloc失败: " << cudaGetErrorString(error) << std::endl;
+                        return;
+                    }
+                    //CHECK(cudaMalloc(&d_warpMatrix, sizeof(float) * 6));
+                    CHECK(cudaMemcpyAsync(d_warpMatrix, h_warpMatrix, sizeof(float) * 6, 
+                                        cudaMemcpyHostToDevice, stream.get()));
+
+                    int jobs = MODEL_INPUT_HEIGHT * MODEL_INPUT_WIDTH;
+                    dim3 block(256, 1);
+                    dim3 grid((jobs + block.x - 1) / block.x, 1);
+                    
+                    sample::gLogInfo << "Launching kernel with jobs=" << jobs << std::endl;
+                    
+                    warp_affine_bilinear_and_normalize_plane_kernel(
+                        binding.pinnedBuffer,
+                        binding.imageInfo.width * 3,
+                        binding.imageInfo.width,
+                        binding.imageInfo.height,
+                        deviceDst,
+                        MODEL_INPUT_WIDTH,
+                        MODEL_INPUT_HEIGHT,
+                        128,
+                        d_warpMatrix,
+                        binding.imageInfo.needNormalize,
+                        jobs
+                    );
+                    
+                    //CHECK(cudaGetLastError());
+                    CHECK(cudaFreeAsync(d_warpMatrix, stream.get()));
+                    sample::gLogInfo << "Kernel completed successfully" << std::endl;
+                    
+                    binding.hasPendingImageProcess = false;
+                }
+                catch (const std::exception& e) {
+                    sample::gLogError << "Error during image processing: " << e.what() << std::endl;
+                }
+            } else {
+                sample::gLogInfo << "No pending image processing, using regular host to device transfer" << std::endl;
+                mBindings[b.second].buffer->hostToDevice(stream);
+            }
         }
     }
 }
+void Bindings::preprocessImage(uint8_t* imgData, int width, int height, bool normalize, cudaStream_t stream) 
+{
+    sample::gLogInfo << "Starting preprocessImage with dimensions " << width << "x" << height << std::endl;
+    
+    imageInfo.data = imgData;
+    imageInfo.width = width;
+    imageInfo.height = height;
+    imageInfo.needNormalize = normalize;
 
+    auto inputBindings = getInputBindings();
+    sample::gLogInfo << "Found " << inputBindings.size() << " inputdsfsdfs4544bindings" << std::endl;
+
+    for (const auto& binding : inputBindings) {
+        sample::gLogInfo << "Processing binding " << binding.first << " with index " << binding.second << std::endl;
+        
+        int bindingIdx = binding.second;
+        if (bindingIdx >= mBindings.size() || !mBindings[bindingIdx].isInput) {
+            sample::gLogInfo << "Skipping invalid binding" << std::endl;
+            continue;
+        }
+
+        mBindings[bindingIdx].setupImagePreprocess(imgData, width, height, normalize);
+        fill(bindingIdx);
+    }
+    
+    sample::gLogInfo << "Image preprocessing setup complete" << std::endl;
+}
 void Bindings::transferOutputToHost(TrtCudaStream& stream)
 {
     for (auto& b : mNames)
@@ -1141,7 +1257,5 @@ bool Bindings::setTensorAddresses(nvinfer1::IExecutionContext& context) const
     }
     return true;
 }
-
-
 
 } // namespace sample
